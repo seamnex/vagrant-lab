@@ -5,6 +5,15 @@
 #   vagrant up            → levanta todo
 #   vagrant ssh app-01    → entra a un nodo
 #   vagrant destroy -f    → borra todo sin dejar rastro
+#
+# Aprovisionamiento con Ansible (opcional, ver ansible/playbook.yml):
+#
+#   ANSIBLE=1 vagrant up              → bootstrap.sh + playbook
+#   ANSIBLE=1 vagrant provision       → re-ejecutar solo el provisioning
+#
+# Va detrás de una variable de entorno a propósito: `ansible_local` instala
+# Ansible dentro de cada VM y eso suma varios minutos al primer `vagrant up`.
+# El default queda rápido; el playbook se pide cuando se lo quiere.
 
 NODOS = [
   { nombre: "app-01",  ip: "192.168.56.11", ram: 1024, cpus: 1, rol: "app" },
@@ -33,6 +42,25 @@ Vagrant.configure("2") do |config|
       vm.vm.provision "shell",
         path: "scripts/bootstrap.sh",
         args: [nodo[:rol], nodo[:ip]]
+
+      # Aprovisionamiento declarativo. Corre DENTRO de la VM (`ansible_local`)
+      # porque el host es Windows y Ansible no tiene soporte nativo ahí:
+      # exigir WSL solo para levantar el lab rompería la reproducibilidad
+      # que es el punto del laboratorio.
+      if ENV["ANSIBLE"]
+        vm.vm.provision "ansible_local" do |ansible|
+          ansible.playbook       = "ansible/playbook.yml"
+          ansible.compatibility_mode = "2.0"
+          # Vagrant limita la ejecución a la VM actual, así que los grupos
+          # tienen que declararse igual para que cada play matchee su rol.
+          # El grupo se llama `monitoreo` y no `monitor` para no colisionar
+          # con el host homónimo, que vuelve ambiguo el `hosts:` del playbook.
+          ansible.groups = {
+            "app"       => ["app-01", "app-02"],
+            "monitoreo" => ["monitor"],
+          }
+        end
+      end
 
       # El nodo monitor expone Grafana/Kibana al host si los instalás
       if nodo[:rol] == "monitor"

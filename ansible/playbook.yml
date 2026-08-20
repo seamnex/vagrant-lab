@@ -1,0 +1,133 @@
+---
+# Aprovisionamiento declarativo del laboratorio.
+#
+# Por qué Ansible además del bootstrap.sh que ya existe: el script en Bash
+# funciona, pero no es idempotente ni sabe en qué estado quedó la VM. Si lo
+# corrés dos veces, el bloque de /etc/hosts se duplica. Ansible describe el
+# estado final deseado y decide él qué hacer para llegar ahí — que es la
+# misma diferencia que hay entre un runbook escrito y uno automatizado.
+#
+#   app-01, app-02 -> Nginx sirviendo una página que identifica al nodo
+#   monitor        -> Docker + Compose para levantar el stack de observabilidad
+#
+# Ejecución: ver README. En este lab corre con `ansible_local`, es decir
+# dentro de cada VM, porque el host es Windows y Ansible no corre nativo ahí.
+
+- name: Base común a todos los nodos
+  hosts: all
+  become: true
+  tasks:
+    - name: Actualizar el índice de paquetes
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Instalar herramientas de diagnóstico
+      # Las que siempre terminás necesitando justo cuando el nodo está caído
+      # y no tenés red para instalarlas.
+      ansible.builtin.apt:
+        name:
+          - curl
+          - vim
+          - htop
+          - net-tools
+          - dnsutils
+          - tcpdump
+          - traceroute
+          - jq
+        state: present
+
+    - name: Fijar la zona horaria
+      # Sin relojes alineados, correlacionar logs entre nodos es adivinar.
+      community.general.timezone:
+        name: America/Argentina/Buenos_Aires
+
+    - name: Resolver los nombres de los nodos del laboratorio
+      # A diferencia del `cat >>` del bootstrap.sh, esto es idempotente:
+      # correrlo diez veces deja una sola línea por host.
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "\\s{{ item.nombre }}$"
+        line: "{{ item.ip }}  {{ item.nombre }}"
+        state: present
+      loop:
+        - { nombre: app-01, ip: 192.168.56.11 }
+        - { nombre: app-02, ip: 192.168.56.12 }
+        - { nombre: monitor, ip: 192.168.56.20 }
+
+- name: Nodos de aplicación — Nginx
+  hosts: app
+  become: true
+  tasks:
+    - name: Instalar Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Publicar una página que identifique al nodo
+      # Para los escenarios de falla hace falta saber qué nodo respondió.
+      # Sin esto, "el servicio anda" no distingue entre uno y dos nodos vivos.
+      ansible.builtin.copy:
+        dest: /var/www/html/index.html
+        mode: "0644"
+        content: |
+          <!doctype html>
+          <html lang="es">
+            <head><meta charset="utf-8"><title>{{ inventory_hostname }}</title></head>
+            <body>
+              <h1>{{ inventory_hostname }}</h1>
+              <p>IP: {{ ansible_default_ipv4.address | default('desconocida') }}</p>
+              <p>Aprovisionado por Ansible</p>
+            </body>
+          </html>
+      notify: Recargar Nginx
+
+    - name: Asegurar que Nginx esté levantado y habilitado al boot
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Verificar que responda localmente
+      # Un "started" de systemd dice que el proceso vive, no que sirva.
+      # Es exactamente la distinción entre liveness y readiness.
+      ansible.builtin.uri:
+        url: http://localhost/
+        status_code: 200
+      register: chequeo
+      retries: 5
+      delay: 3
+      until: chequeo is succeeded
+
+  handlers:
+    - name: Recargar Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+- name: Nodo monitor — Docker
+  hosts: monitoreo
+  become: true
+  tasks:
+    - name: Instalar Docker y Compose
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+        state: present
+
+    - name: Asegurar que el daemon esté levantado y habilitado al boot
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Permitir a vagrant usar Docker sin sudo
+      ansible.builtin.user:
+        name: vagrant
+        groups: docker
+        append: true
+
+    - name: Verificar que el daemon responda
+      ansible.builtin.command: docker info
+      changed_when: false

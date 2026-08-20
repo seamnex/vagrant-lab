@@ -21,21 +21,29 @@ Sin un entorno descartable no hay forma de practicar la respuesta a incidentes.
 ## La solución
 
 Infraestructura declarada en un `Vagrantfile`: tres nodos Ubuntu 22.04 en red privada,
-con provisioning automatizado en Bash. El entorno completo se levanta con un comando,
-se destruye con otro, y **siempre queda idéntico** porque está definido en código versionado.
+con dos capas de provisioning —un `bootstrap.sh` mínimo y un playbook de Ansible
+opcional—. El entorno completo se levanta con un comando, se destruye con otro, y
+**siempre queda idéntico** porque está definido en código versionado.
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Host (Windows + VirtualBox)                        │
-│                                                     │
-│   ┌──────────┐  ┌──────────┐  ┌─────────────────┐   │
-│   │  app-01  │  │  app-02  │  │     monitor     │   │
-│   │ .56.11   │  │ .56.12   │  │    .56.20       │   │
-│   │          │  │          │  │  Docker + 5601  │   │
-│   └────┬─────┘  └────┬─────┘  └────────┬────────┘   │
-│        └─────────────┴─────────────────┘            │
-│              red privada 192.168.56.0/24            │
-└─────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph host ["Host — Windows + VirtualBox 7.x · red privada 192.168.56.0/24"]
+        A1["app-01 · .56.11<br/>1 GB · 1 vCPU<br/>Nginx"]
+        A2["app-02 · .56.12<br/>1 GB · 1 vCPU<br/>Nginx"]
+        MON["monitor · .56.20<br/>2 GB · 2 vCPU<br/>Docker + Compose"]
+    end
+
+    PROV["Provisioning<br/>bootstrap.sh → base común<br/>ansible/playbook.yml → roles"]
+    NAV["Navegador del host<br/>localhost:5601 · :3000"]
+
+    PROV -.-> A1
+    PROV -.-> A2
+    PROV -.-> MON
+
+    A1 <-->|"ICMP · SSH · HTTP"| MON
+    A2 <-->|"ICMP · SSH · HTTP"| MON
+
+    MON -->|"forwarded_port"| NAV
 ```
 
 ---
@@ -66,6 +74,59 @@ vagrant provision monitor          # re-ejecutar el provisioning
 vagrant halt                       # apagar sin destruir
 vagrant ssh app-01 -c "uptime"     # ejecutar un comando remoto
 ```
+
+---
+
+## Aprovisionamiento
+
+Hay dos capas, y conviven a propósito.
+
+**`scripts/bootstrap.sh`** corre siempre. Deja el piso mínimo: herramientas de
+diagnóstico, zona horaria y resolución de nombres entre nodos. Es Bash, es rápido
+y no depende de nada.
+
+**`ansible/playbook.yml`** es opcional y describe el estado final de cada rol:
+
+```bash
+ANSIBLE=1 vagrant up              # levanta y aplica el playbook
+ANSIBLE=1 vagrant provision       # re-aplicar sin recrear las VMs
+```
+
+| Grupo | Nodos | Qué instala | Cómo se verifica |
+|---|---|---|---|
+| `app` | app-01, app-02 | Nginx + una página que identifica al nodo | `uri` contra `localhost` esperando 200, con reintentos |
+| `monitoreo` | monitor | Docker + Compose, `vagrant` en el grupo `docker` | `docker info` |
+
+Corre con el provisioner **`ansible_local`**, es decir *dentro* de cada VM. No es
+un detalle menor: Ansible no tiene soporte nativo en Windows, y exigir WSL solo
+para levantar el laboratorio rompería la reproducibilidad que es el punto de todo
+esto. El costo es que Vagrant instala Ansible en cada VM, y por eso va detrás de
+una variable de entorno en vez de estar siempre activo.
+
+Si tenés una máquina de control Linux/WSL/macOS con acceso SSH a las VMs, el
+`ansible/inventory.ini` sirve para correrlo desde afuera:
+
+```bash
+vagrant ssh-config > /tmp/ssh-lab
+ansible-playbook -i ansible/inventory.ini ansible/playbook.yml
+```
+
+### Por qué agregar Ansible si el Bash ya funcionaba
+
+El `bootstrap.sh` funciona, pero **no es idempotente**: su bloque de `/etc/hosts`
+usa `cat >>`, así que cada `vagrant provision` duplica las tres líneas. Nunca lo
+noté porque en el flujo normal se corre una sola vez —y esa es exactamente la
+clase de bug que aparece el día que reprovisionás un nodo en medio de un incidente.
+
+La tarea equivalente en el playbook usa `lineinfile` con un `regexp`: corrés diez
+veces, queda una línea. **La diferencia entre un script y una herramienta de
+gestión de configuración no es el lenguaje: es que una describe pasos y la otra
+describe el estado final**, y solo la segunda es segura de re-ejecutar sobre un
+nodo cuyo estado no conocés. Que es, siempre, el nodo del incidente.
+
+Detalle chico con el que me tropecé: el grupo de Ansible se llama `monitoreo` y
+no `monitor` porque el host ya se llama así, y un grupo homónimo hace que Ansible
+avise `Found both group and host with same name` y vuelve ambiguo el `hosts:`.
 
 ---
 
@@ -111,9 +172,12 @@ Para cada escenario, el ejercicio real es cronometrar:
 
 ```
 vagrant-lab/
-├── Vagrantfile            # definición de los 3 nodos
+├── Vagrantfile            # definición de los 3 nodos + provisioners
 ├── scripts/
-│   └── bootstrap.sh       # provisioning común (herramientas, hosts, timezone)
+│   └── bootstrap.sh       # provisioning base (herramientas, hosts, timezone)
+├── ansible/
+│   ├── playbook.yml       # estado final por rol: Nginx en app, Docker en monitor
+│   └── inventory.ini      # inventario para correrlo desde una máquina de control
 └── README.md
 ```
 

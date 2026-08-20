@@ -1,0 +1,9 @@
+# Los scripts de shell se checkoutean SIEMPRE con LF, incluso en Windows.
+# El bootstrap.sh se ejecuta dentro de las VMs Ubuntu: si un clon en Windows
+# lo convierte a CRLF, el provisioning falla con
+# `bad interpreter: /usr/bin/env bash^M` y el mensaje no delata la causa.
+*.sh text eol=lf
+
+# El playbook y el inventario los consume Ansible dentro de las VMs.
+*.yml text eol=lf
+*.ini text eol=lf
